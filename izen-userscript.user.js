@@ -1,17 +1,21 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.2.0
-// @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city / bypass.tools), better mobile support, loop protection, persisted settings, and cleaner UI.
+// @version      3.3.0
+// @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city+adbypass.org / bypass.tools), better mobile support, loop protection, persisted settings, and cleaner UI.
 // @author       Gabriel
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @connect      izen.lol
 // @connect      bypass.vip
 // @connect      bypass.city
 // @connect      bypass.tools
+// @connect      adbypass.org
+// @match        *://bypass.city/*
+// @match        *://adbypass.org/*
 // @match        *://auth.platorelay.com/*
 // @match        *://auth.platoboost.app/*
 // @match        *://auth.platoboost.me/*
@@ -165,21 +169,30 @@
         // used; if none respond, the primary is used anyway.
         //
         // Each service has its own endpoint shape, confirmed from that
-        // service's own official userscript where possible. `redirectParam`
-        // is the query param the service appends when it sends the user
-        // back with a resolved destination.
+        // service's own official userscript where possible.
+        //
+        // Most resolvers are "query" mode: GET a URL, get sent back with
+        // the destination in a query param (`redirectParam`).
         //   - izen.lol:     GET /userscript ?url=&apikey=&time=   -> ?redirect=
         //   - bypass.vip:   GET /userscript.html ?url=&key=&time= -> ?redirect=
-        //   - bypass.city:  shape unconfirmed — mirrored on bypass.vip's
-        //     contract as a best guess since no official userscript for it
-        //     was available to check. Update this entry once confirmed.
         //   - bypass.tools: GET /wait ?url=&wait=                 -> ?referrer=
         //     (bypass.tools' full userscript is actually a standalone
         //     in-page bypass engine, not a redirect-handoff resolver like
         //     the others; only its simple /wait handoff page is used here.)
+        //
+        // bypass.city (and its mirror adbypass.org) is "storage" mode: it
+        // does NOT return the destination via a query param at all. Its
+        // official userscript instead runs *on bypass.city's own domain*,
+        // waits for a `bypassComplete` DOM event the site dispatches once
+        // solved, stashes the resolved URL in GM storage (which is shared
+        // across every site for a given script), and sends the browser
+        // back to the gate site's bare origin — where the script picks the
+        // stashed URL back up. See runBypassCityListener() and the
+        // 'storage' branch of buildHandoffUrl()/getStorageBasedTarget().
         resolvers: [
             {
                 origin: 'https://izen.lol',
+                mode: 'query',
                 path: '/userscript',
                 timeParam: 'time',
                 apiKeyParam: 'apikey',
@@ -187,6 +200,7 @@
             },
             {
                 origin: 'https://bypass.vip',
+                mode: 'query',
                 path: '/userscript.html',
                 timeParam: 'time',
                 apiKeyParam: 'key',
@@ -194,13 +208,17 @@
             },
             {
                 origin: 'https://bypass.city',
-                path: '/userscript.html',
-                timeParam: 'time',
-                apiKeyParam: 'key',
-                redirectParam: 'redirect',
+                mode: 'storage',
+                path: '/bypass',
+            },
+            {
+                origin: 'https://adbypass.org',
+                mode: 'storage',
+                path: '/bypass',
             },
             {
                 origin: 'https://bypass.tools',
+                mode: 'query',
                 path: '/wait',
                 timeParam: 'wait',
                 apiKeyParam: null,
@@ -228,6 +246,16 @@
     const SETTINGS_KEYS = Object.freeze({
         autoContinue: 'izen_userscript_auto_continue',
         theme: 'izen_userscript_theme',
+    });
+
+    // GM-storage keys used for bypass.city / adbypass.org's "storage mode"
+    // handoff (see the resolvers comment in CONFIG for how this differs
+    // from the query-param resolvers). GM storage is shared across every
+    // site this script runs on, which is what lets the callback survive
+    // the round trip through a completely different domain.
+    const BYPASS_CITY_KEYS = Object.freeze({
+        callback: 'izen_userscript_bc_callback',
+        data: 'izen_userscript_bc_data',
     });
 
     // Stored on the gateway domain before going to izen. sessionStorage
@@ -322,6 +350,25 @@
             return raw === null ? fallback : JSON.parse(raw);
         } catch {
             return fallback;
+        }
+    }
+
+    function persistDelete(key) {
+        const deleteValue = gmApi('GM_deleteValue');
+
+        if (deleteValue) {
+            try {
+                deleteValue(key);
+                return;
+            } catch {
+                // Fall through to localStorage.
+            }
+        }
+
+        try {
+            localStorage.removeItem(key);
+        } catch {
+            // Storage may be blocked. Nothing else required.
         }
     }
 
@@ -460,6 +507,21 @@
         return Boolean(referrer && isTrustedResolverHost(referrer.hostname));
     }
 
+    const STORAGE_RESOLVER_HOSTS = CONFIG.resolvers
+        .filter((resolver) => resolver.mode === 'storage')
+        .map((resolver) => {
+            try {
+                return new URL(resolver.origin).hostname.toLowerCase();
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+
+    function isStorageResolverDomain() {
+        return STORAGE_RESOLVER_HOSTS.includes(window.location.hostname.toLowerCase());
+    }
+
     /*
      * ============================================================
      * SESSION HANDOFF
@@ -545,7 +607,9 @@
      */
 
     const KNOWN_REDIRECT_PARAMS = [
-        ...new Set(CONFIG.resolvers.map((resolver) => resolver.redirectParam)),
+        ...new Set(
+            CONFIG.resolvers.map((resolver) => resolver.redirectParam).filter(Boolean)
+        ),
     ];
 
     function getSourceUrlForHandoff() {
@@ -561,7 +625,23 @@
         return source.href;
     }
 
-    function buildHandoffUrl(resolver) {
+    function buildStorageModeHandoffUrl(resolver) {
+        // Storage-mode resolvers (bypass.city, adbypass.org) don't return
+        // the destination via query param — they redirect back to the
+        // site's bare origin and expect the answer to already be sitting
+        // in GM storage (see runBypassCityListener()). Stash where to
+        // return to *before* navigating away.
+        persistSet(BYPASS_CITY_KEYS.callback, window.location.origin + '/');
+
+        const endpoint = new URL(resolver.path, resolver.origin);
+
+        endpoint.searchParams.set('bypass', getSourceUrlForHandoff());
+        endpoint.searchParams.set('userscript', 'true');
+
+        return endpoint.href;
+    }
+
+    function buildQueryModeHandoffUrl(resolver) {
         const endpoint = new URL(resolver.path, resolver.origin);
 
         endpoint.searchParams.set('url', getSourceUrlForHandoff());
@@ -580,6 +660,12 @@
         );
 
         return endpoint.href;
+    }
+
+    function buildHandoffUrl(resolver) {
+        return resolver.mode === 'storage'
+            ? buildStorageModeHandoffUrl(resolver)
+            : buildQueryModeHandoffUrl(resolver);
     }
 
     /*
@@ -655,6 +741,49 @@
 
     /*
      * ============================================================
+     * BYPASS.CITY / ADBYPASS.ORG LISTENER
+     * ============================================================
+     *
+     * Runs only when we're actually sitting on bypass.city or
+     * adbypass.org (see the @match entries and the mode check in main()).
+     * Their page dispatches a `bypassComplete` custom event on
+     * `window` once it has solved the gate site, carrying the resolved
+     * destination as `event.detail.bypassData`.
+     */
+
+    function runBypassCityListener() {
+        window.addEventListener(
+            'bypassComplete',
+            (event) => {
+                try {
+                    const detail = event?.detail;
+                    const destination =
+                        detail && typeof detail === 'object' ? detail.bypassData : detail;
+
+                    const callback = persistGet(BYPASS_CITY_KEYS.callback, null);
+                    persistDelete(BYPASS_CITY_KEYS.callback);
+
+                    if (!destination || !callback) {
+                        log(
+                            'bypassComplete event missing destination or callback:',
+                            detail,
+                            callback
+                        );
+                        return;
+                    }
+
+                    persistSet(BYPASS_CITY_KEYS.data, destination);
+                    window.location.assign(callback);
+                } catch (error) {
+                    log('Failed to handle bypassComplete event:', error);
+                }
+            },
+            { once: true }
+        );
+    }
+
+    /*
+     * ============================================================
      * REDIRECT RESULT
      * ============================================================
      */
@@ -710,6 +839,37 @@
         // Successful return. We don't need the handoff markers anymore.
         removeStorage(PENDING_KEY);
         removeStorage(HANDOFF_KEY);
+
+        return target;
+    }
+
+    /*
+     * ============================================================
+     * STORAGE-MODE RESULT (bypass.city / adbypass.org)
+     * ============================================================
+     *
+     * No query param here — runBypassCityListener() (running on
+     * bypass.city's own page) stashes the resolved destination in GM
+     * storage before sending the browser back to our bare origin. We only
+     * ever read a value here that our own script wrote, so there's no
+     * separate origin-trust check needed the way there is for the query
+     * param resolvers.
+     */
+
+    function getStorageBasedTarget() {
+        const raw = persistGet(BYPASS_CITY_KEYS.data, null);
+
+        if (!raw) {
+            return null;
+        }
+
+        persistDelete(BYPASS_CITY_KEYS.data);
+
+        const target = parseHttpUrl(typeof raw === 'string' ? raw : raw?.bypassData);
+
+        if (!target) {
+            throw new Error('The destination returned by bypass.city is invalid.');
+        }
 
         return target;
     }
@@ -1533,15 +1693,28 @@
 
     async function main() {
         try {
+            // bypass.city/adbypass.org don't return via query param — we
+            // just sit on their page and wait for their completion event.
+            // Nothing else in main() applies there.
+            if (isStorageResolverDomain()) {
+                runBypassCityListener();
+                return;
+            }
+
             const current = new URL(window.location.href);
 
             const hasAnyRedirectParam = KNOWN_REDIRECT_PARAMS.some((param) =>
                 current.searchParams.has(param)
             );
 
+            // A storage-mode resolver may have already dropped a resolved
+            // destination in GM storage for us to pick up on this reload.
+            const storageTarget = getStorageBasedTarget();
+
             // If a resolver has returned us a redirect, validate and
             // display it. Otherwise send the current URL off for resolving.
-            const target = hasAnyRedirectParam ? getRedirectTarget() : null;
+            const target =
+                storageTarget || (hasAnyRedirectParam ? getRedirectTarget() : null);
 
             if (!target) {
                 await handoffToIzen();
