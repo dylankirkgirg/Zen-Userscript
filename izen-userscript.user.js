@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      2.2.0
+// @version      2.3.0
 // @description  Improved izen.lol userscript with safer redirects, better mobile support, loop protection, and cleaner UI.
 // @author       Gabriel
 // @match        *://auth.platorelay.com/*
@@ -141,8 +141,8 @@
         // false = Continue button becomes available immediately.
         wait_before_redirect: true,
 
-        // Preserve the longer Linkvertise hash-page delay.
-        linkvertise_hash_wait: 10,
+        // Linkvertise hash-page delay.
+        linkvertise_hash_wait: 1,
 
         // Prevent bad/configured values from creating massive timers.
         max_wait_seconds: 300,
