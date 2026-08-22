@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.3.0
+// @version      3.4.1
 // @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city+adbypass.org / bypass.tools), better mobile support, loop protection, persisted settings, and cleaner UI.
 // @author       Gabriel
 // @grant        GM_xmlhttpRequest
@@ -9,6 +9,7 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @connect      izen.lol
 // @connect      bypass.vip
 // @connect      bypass.city
@@ -263,6 +264,12 @@
     // when Referer is stripped.
     const PENDING_KEY = '__izen_userscript_pending_v2__';
     const HANDOFF_KEY = '__izen_userscript_last_handoff_v2__';
+
+    // Records which resolver actually ended up being used, so the return
+    // trip can tell the user when a backup provider handled the bypass
+    // instead of the configured primary (e.g. because the primary failed
+    // its reachability probe). Read-once: consumed as soon as it's checked.
+    const USED_RESOLVER_KEY = '__izen_userscript_used_resolver_v1__';
 
     const PENDING_TTL_MS = 10 * 60 * 1000;
     const HANDOFF_GUARD_MS = 4000;
@@ -590,14 +597,41 @@
         const timestamp = Number(last.timestamp || 0);
         const age = Date.now() - timestamp;
 
-        return last.pageKey === getPageKey() && age >= 0 && age < HANDOFF_GUARD_MS;
+        // Origin-level match, not exact pathname: storage-mode resolvers
+        // (bypass.city/adbypass.org) send the browser back to the site's
+        // bare origin rather than the original path, so a pathname-exact
+        // check here would never catch a tight bounce loop through them.
+        return last.origin === window.location.origin && age >= 0 && age < HANDOFF_GUARD_MS;
     }
 
     function markHandoffNow() {
         writeJsonStorage(HANDOFF_KEY, {
             timestamp: Date.now(),
-            pageKey: getPageKey(),
+            origin: window.location.origin,
         });
+    }
+
+    function markUsedResolver(resolver) {
+        writeJsonStorage(USED_RESOLVER_KEY, {
+            origin: resolver.origin,
+            timestamp: Date.now(),
+        });
+    }
+
+    // Read-once: returns the resolver origin used for the handoff that led
+    // to this page load (if any, and not stale), then clears the marker so
+    // it can't leak into an unrelated later load.
+    function consumeUsedResolverOrigin() {
+        const raw = readJsonStorage(USED_RESOLVER_KEY);
+        removeStorage(USED_RESOLVER_KEY);
+
+        if (!raw || typeof raw !== 'object') {
+            return null;
+        }
+
+        const age = Date.now() - Number(raw.timestamp || 0);
+
+        return age >= 0 && age <= PENDING_TTL_MS ? raw.origin || null : null;
     }
 
     /*
@@ -631,7 +665,16 @@
         // site's bare origin and expect the answer to already be sitting
         // in GM storage (see runBypassCityListener()). Stash where to
         // return to *before* navigating away.
-        persistSet(BYPASS_CITY_KEYS.callback, window.location.origin + '/');
+        //
+        // GM storage (unlike sessionStorage) persists indefinitely across
+        // every tab and site for this script, so this is timestamped and
+        // treated as stale past PENDING_TTL_MS — otherwise an interrupted
+        // round trip could leave a value that a much later, unrelated page
+        // load mistakes for a fresh one.
+        persistSet(BYPASS_CITY_KEYS.callback, {
+            url: window.location.origin + '/',
+            timestamp: Date.now(),
+        });
 
         const endpoint = new URL(resolver.path, resolver.origin);
 
@@ -733,6 +776,7 @@
 
         markPendingHandoff(resolver);
         markHandoffNow();
+        markUsedResolver(resolver);
 
         log('Handing off to resolver:', target);
 
@@ -760,20 +804,30 @@
                     const destination =
                         detail && typeof detail === 'object' ? detail.bypassData : detail;
 
-                    const callback = persistGet(BYPASS_CITY_KEYS.callback, null);
+                    const callbackRecord = persistGet(BYPASS_CITY_KEYS.callback, null);
                     persistDelete(BYPASS_CITY_KEYS.callback);
 
-                    if (!destination || !callback) {
+                    const callbackAge =
+                        Date.now() - Number(callbackRecord?.timestamp || 0);
+                    const callbackUrl =
+                        callbackAge >= 0 && callbackAge <= PENDING_TTL_MS
+                            ? callbackRecord?.url
+                            : null;
+
+                    if (!destination || !callbackUrl) {
                         log(
-                            'bypassComplete event missing destination or callback:',
+                            'bypassComplete event missing destination or a fresh callback:',
                             detail,
-                            callback
+                            callbackRecord
                         );
                         return;
                     }
 
-                    persistSet(BYPASS_CITY_KEYS.data, destination);
-                    window.location.assign(callback);
+                    persistSet(BYPASS_CITY_KEYS.data, {
+                        url: destination,
+                        timestamp: Date.now(),
+                    });
+                    window.location.assign(callbackUrl);
                 } catch (error) {
                     log('Failed to handle bypassComplete event:', error);
                 }
@@ -865,7 +919,17 @@
 
         persistDelete(BYPASS_CITY_KEYS.data);
 
-        const target = parseHttpUrl(typeof raw === 'string' ? raw : raw?.bypassData);
+        // GM storage persists indefinitely across every tab and site, so a
+        // value left over from an interrupted round trip must not be
+        // mistaken for a fresh one on some unrelated later page load.
+        const age = Date.now() - Number(raw?.timestamp || 0);
+
+        if (!(age >= 0 && age <= PENDING_TTL_MS)) {
+            log('Ignoring stale bypass.city storage data:', raw);
+            return null;
+        }
+
+        const target = parseHttpUrl(raw?.url);
 
         if (!target) {
             throw new Error('The destination returned by bypass.city is invalid.');
@@ -1134,6 +1198,19 @@
                     cursor: help;
                 }
 
+                .provider-notice {
+                    display: none;
+                    margin-bottom: 18px;
+                    padding: 10px 13px;
+                    border: 1px solid rgba(245, 158, 11, 0.28);
+                    border-radius: 11px;
+                    background: rgba(245, 158, 11, 0.10);
+                    color: #fbbf24;
+                    font-size: 12px;
+                    line-height: 1.45;
+                    text-align: left;
+                }
+
                 .countdown-row {
                     display: flex;
                     align-items: baseline;
@@ -1316,6 +1393,8 @@
 
                     <div class="destination" id="destination">Preparing destination…</div>
 
+                    <div class="provider-notice" id="providerNotice" role="status" aria-live="polite"></div>
+
                     <div class="countdown-row">
                         <span class="countdown" id="countdown" role="status" aria-live="polite">Preparing…</span>
                         <span class="percent" id="percent"></span>
@@ -1355,6 +1434,7 @@
             host,
             shadow,
             destination: $('#destination'),
+            providerNotice: $('#providerNotice'),
             countdown: $('#countdown'),
             percent: $('#percent'),
             progressFill: $('#progressFill'),
@@ -1608,7 +1688,26 @@
      * ============================================================
      */
 
-    async function showRedirectUI(target) {
+    function showProviderChangedNotice(ui, usedResolverOrigin) {
+        const primaryOrigin = CONFIG.resolvers[0].origin;
+
+        if (!usedResolverOrigin || usedResolverOrigin === primaryOrigin) {
+            return;
+        }
+
+        let hostname = usedResolverOrigin;
+
+        try {
+            hostname = new URL(usedResolverOrigin).hostname;
+        } catch {
+            // Keep the raw origin string as a fallback.
+        }
+
+        ui.providerNotice.textContent = `Using backup provider ${hostname} — the primary provider was unavailable.`;
+        ui.providerNotice.style.display = 'block';
+    }
+
+    async function showRedirectUI(target, usedResolverOrigin = null) {
         const waitTime = isLinkvertiseHashPage()
             ? getWaitSeconds(CONFIG.linkvertise_hash_wait, 10)
             : getWaitSeconds(CONFIG.time, 1);
@@ -1661,6 +1760,7 @@
 
         wireSettingsControls(ui);
         wireReportButton(ui, target);
+        showProviderChangedNotice(ui, usedResolverOrigin);
 
         startCountdown(target, waitTime, ui);
     }
@@ -1721,7 +1821,11 @@
                 return;
             }
 
-            await showRedirectUI(target);
+            // Which resolver actually handled this — used to notify the
+            // user when a backup provider stepped in for the primary.
+            const usedResolverOrigin = consumeUsedResolverOrigin();
+
+            await showRedirectUI(target, usedResolverOrigin);
         } catch (error) {
             console.error('[izen userscript]', error);
             await showFatalError(error);
