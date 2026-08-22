@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.1.0
-// @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city), better mobile support, loop protection, persisted settings, and cleaner UI.
+// @version      3.2.0
+// @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city / bypass.tools), better mobile support, loop protection, persisted settings, and cleaner UI.
 // @author       Gabriel
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -11,6 +11,7 @@
 // @connect      izen.lol
 // @connect      bypass.vip
 // @connect      bypass.city
+// @connect      bypass.tools
 // @match        *://auth.platorelay.com/*
 // @match        *://auth.platoboost.app/*
 // @match        *://auth.platoboost.me/*
@@ -164,27 +165,46 @@
         // used; if none respond, the primary is used anyway.
         //
         // Each service has its own endpoint shape, confirmed from that
-        // service's own official userscript where possible:
-        //   - izen.lol:    GET /userscript      ?url=&apikey=&time=
-        //   - bypass.vip:  GET /userscript.html ?url=&key=&time=
-        //   - bypass.city: shape unconfirmed — mirrored on bypass.vip's
+        // service's own official userscript where possible. `redirectParam`
+        // is the query param the service appends when it sends the user
+        // back with a resolved destination.
+        //   - izen.lol:     GET /userscript ?url=&apikey=&time=   -> ?redirect=
+        //   - bypass.vip:   GET /userscript.html ?url=&key=&time= -> ?redirect=
+        //   - bypass.city:  shape unconfirmed — mirrored on bypass.vip's
         //     contract as a best guess since no official userscript for it
         //     was available to check. Update this entry once confirmed.
+        //   - bypass.tools: GET /wait ?url=&wait=                 -> ?referrer=
+        //     (bypass.tools' full userscript is actually a standalone
+        //     in-page bypass engine, not a redirect-handoff resolver like
+        //     the others; only its simple /wait handoff page is used here.)
         resolvers: [
             {
                 origin: 'https://izen.lol',
                 path: '/userscript',
+                timeParam: 'time',
                 apiKeyParam: 'apikey',
+                redirectParam: 'redirect',
             },
             {
                 origin: 'https://bypass.vip',
                 path: '/userscript.html',
+                timeParam: 'time',
                 apiKeyParam: 'key',
+                redirectParam: 'redirect',
             },
             {
                 origin: 'https://bypass.city',
                 path: '/userscript.html',
+                timeParam: 'time',
                 apiKeyParam: 'key',
+                redirectParam: 'redirect',
+            },
+            {
+                origin: 'https://bypass.tools',
+                path: '/wait',
+                timeParam: 'wait',
+                apiKeyParam: null,
+                redirectParam: 'referrer',
             },
         ],
 
@@ -476,24 +496,25 @@
         }
     }
 
-    function hasValidPendingHandoff() {
+    function readValidPendingHandoff() {
         const pending = readJsonStorage(PENDING_KEY);
 
         if (!pending || typeof pending !== 'object') {
-            return false;
+            return null;
         }
 
         const timestamp = Number(pending.timestamp || 0);
         const age = Date.now() - timestamp;
         const samePage = pending.pageKey === getPageKey();
 
-        return samePage && age >= 0 && age <= PENDING_TTL_MS;
+        return samePage && age >= 0 && age <= PENDING_TTL_MS ? pending : null;
     }
 
-    function markPendingHandoff() {
+    function markPendingHandoff(resolver) {
         writeJsonStorage(PENDING_KEY, {
             timestamp: Date.now(),
             pageKey: getPageKey(),
+            redirectParam: resolver.redirectParam,
         });
     }
 
@@ -523,12 +544,19 @@
      * ============================================================
      */
 
+    const KNOWN_REDIRECT_PARAMS = [
+        ...new Set(CONFIG.resolvers.map((resolver) => resolver.redirectParam)),
+    ];
+
     function getSourceUrlForHandoff() {
         const source = new URL(window.location.href);
 
-        // Never send a preexisting redirect result back through izen as
-        // the source URL.
-        source.searchParams.delete('redirect');
+        // Never send a preexisting redirect result back through a resolver
+        // as the source URL — strip every known return-param name, since
+        // different resolvers use different ones (redirect, referrer, ...).
+        for (const param of KNOWN_REDIRECT_PARAMS) {
+            source.searchParams.delete(param);
+        }
 
         return source.href;
     }
@@ -538,14 +566,18 @@
 
         endpoint.searchParams.set('url', getSourceUrlForHandoff());
 
-        // API KEY IS OPTIONAL. If empty, don't even add the parameter.
+        // API KEY IS OPTIONAL. If empty, or the resolver has no concept of
+        // one, don't even add the parameter.
         const apiKey = String(CONFIG.apikey || '').trim();
 
-        if (apiKey) {
+        if (apiKey && resolver.apiKeyParam) {
             endpoint.searchParams.set(resolver.apiKeyParam, apiKey);
         }
 
-        endpoint.searchParams.set('time', String(getWaitSeconds(CONFIG.time, 1)));
+        endpoint.searchParams.set(
+            resolver.timeParam,
+            String(getWaitSeconds(CONFIG.time, 1))
+        );
 
         return endpoint.href;
     }
@@ -610,11 +642,11 @@
             throw new Error('A redirect loop was detected. Reload the page and try again.');
         }
 
-        markPendingHandoff();
-        markHandoffNow();
-
         const resolver = await selectResolver();
         const target = buildHandoffUrl(resolver);
+
+        markPendingHandoff(resolver);
+        markHandoffNow();
 
         log('Handing off to resolver:', target);
 
@@ -627,18 +659,37 @@
      * ============================================================
      */
 
+    // Which query param(s) to check for a resolved destination on this
+    // page load. If we have a valid pending-handoff record, we know
+    // exactly which resolver we sent the user to and can check only its
+    // param name; otherwise (referrer-only trust, e.g. pending expired or
+    // storage blocked) fall back to checking every known param name.
+    function candidateRedirectParams(pending) {
+        if (pending && pending.redirectParam) {
+            return [pending.redirectParam];
+        }
+
+        return KNOWN_REDIRECT_PARAMS;
+    }
+
     function getRedirectTarget() {
         const current = new URL(window.location.href);
-        const rawRedirect = current.searchParams.get('redirect');
+        const pending = readValidPendingHandoff();
+
+        const paramName = candidateRedirectParams(pending).find((param) =>
+            current.searchParams.has(param)
+        );
+
+        const rawRedirect = paramName ? current.searchParams.get(paramName) : null;
 
         if (!rawRedirect) {
             return null;
         }
 
         // document.referrer can disappear because of browser privacy /
-        // Referrer-Policy. Therefore we accept either an izen referrer or
-        // our valid session handoff marker.
-        const trustedReturn = referrerIsTrustedResolver() || hasValidPendingHandoff();
+        // Referrer-Policy. Therefore we accept either a trusted resolver
+        // referrer or our valid session handoff marker.
+        const trustedReturn = referrerIsTrustedResolver() || pending !== null;
 
         if (!trustedReturn) {
             log('Ignoring untrusted redirect parameter.');
@@ -648,7 +699,7 @@
         const target = parseHttpUrl(rawRedirect);
 
         if (!target) {
-            throw new Error('The redirect destination returned by izen is invalid.');
+            throw new Error('The redirect destination returned by the resolver is invalid.');
         }
 
         // Stop a redirect directly back to ourselves.
@@ -1483,11 +1534,14 @@
     async function main() {
         try {
             const current = new URL(window.location.href);
-            const rawRedirect = current.searchParams.get('redirect');
+
+            const hasAnyRedirectParam = KNOWN_REDIRECT_PARAMS.some((param) =>
+                current.searchParams.has(param)
+            );
 
             // If a resolver has returned us a redirect, validate and
             // display it. Otherwise send the current URL off for resolving.
-            const target = rawRedirect ? getRedirectTarget() : null;
+            const target = hasAnyRedirectParam ? getRedirectTarget() : null;
 
             if (!target) {
                 await handoffToIzen();
