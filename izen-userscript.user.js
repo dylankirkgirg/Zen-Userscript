@@ -1,9 +1,16 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
-// @description  Improved izen.lol userscript with safer redirects, better mobile support, loop protection, and cleaner UI.
+// @version      3.0.0
+// @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city), better mobile support, loop protection, persisted settings, and cleaner UI.
 // @author       Gabriel
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @connect      izen.lol
+// @connect      bypass.vip
+// @connect      bypass.city
 // @match        *://auth.platorelay.com/*
 // @match        *://auth.platoboost.app/*
 // @match        *://auth.platoboost.me/*
@@ -148,7 +155,25 @@
         max_wait_seconds: 300,
 
         // Auto-continue once the countdown finishes, without waiting for a click.
+        // (Overridable at runtime via the in-UI settings toggle, which wins
+        // once the user has changed it.)
         auto_continue: false,
+
+        // Resolver services to try, in priority order. Each is pinged (when
+        // GM_xmlhttpRequest is available) and the first reachable one is
+        // used; if none respond, the primary is used anyway.
+        resolver_origins: [
+            'https://izen.lol',
+            'https://bypass.vip',
+            'https://bypass.city',
+        ],
+
+        // How long to wait for a resolver to respond to a reachability
+        // check before trying the next one.
+        resolver_ping_timeout_ms: 2500,
+
+        // Where "Report broken site" opens.
+        report_issue_url: 'https://github.com/dylankirkgirg/Zen-Userscript/issues/new',
 
         // Console debugging.
         debug: false,
@@ -160,8 +185,12 @@
      * ============================================================
      */
 
-    const IZEN_ORIGIN = 'https://izen.lol';
-    const IZEN_ENDPOINT = `${IZEN_ORIGIN}/userscript`;
+    const RESOLVER_PATH = '/userscript';
+
+    const SETTINGS_KEYS = Object.freeze({
+        autoContinue: 'izen_userscript_auto_continue',
+        theme: 'izen_userscript_theme',
+    });
 
     // Stored on the gateway domain before going to izen. sessionStorage
     // survives navigation away and back within the same tab, which helps
@@ -188,6 +217,133 @@
             return;
         }
         console.log('[izen userscript]', ...args);
+    }
+
+    /*
+     * ============================================================
+     * GM API SHIMS
+     * ============================================================
+     *
+     * Falls back to localStorage / a direct navigation attempt when the
+     * userscript manager doesn't expose the GM_* APIs (e.g. some
+     * lightweight managers, or a @grant none install).
+     */
+
+    function gmApi(name) {
+        try {
+            if (typeof window[name] === 'function') {
+                return window[name];
+            }
+
+            if (
+                typeof GM !== 'undefined' &&
+                typeof GM[name.replace(/^GM_/, '')] === 'function'
+            ) {
+                return GM[name.replace(/^GM_/, '')].bind(GM);
+            }
+        } catch {
+            // Ignore — treat as unavailable.
+        }
+
+        return null;
+    }
+
+    function persistSet(key, value) {
+        const setValue = gmApi('GM_setValue');
+
+        if (setValue) {
+            try {
+                setValue(key, value);
+                return;
+            } catch {
+                // Fall through to localStorage.
+            }
+        }
+
+        try {
+            localStorage.setItem(key, JSON.stringify(value));
+        } catch {
+            // Storage may be blocked. Setting just won't persist.
+        }
+    }
+
+    function persistGet(key, fallback) {
+        const getValue = gmApi('GM_getValue');
+
+        if (getValue) {
+            try {
+                const value = getValue(key, undefined);
+                return value === undefined ? fallback : value;
+            } catch {
+                // Fall through to localStorage.
+            }
+        }
+
+        try {
+            const raw = localStorage.getItem(key);
+            return raw === null ? fallback : JSON.parse(raw);
+        } catch {
+            return fallback;
+        }
+    }
+
+    function gmHttpRequest(details) {
+        const request = gmApi('GM_xmlhttpRequest');
+
+        if (!request) {
+            return Promise.reject(new Error('GM_xmlhttpRequest unavailable'));
+        }
+
+        return new Promise((resolve, reject) => {
+            try {
+                request({
+                    ...details,
+                    onload: resolve,
+                    onerror: () => reject(new Error('Request failed')),
+                    ontimeout: () => reject(new Error('Request timed out')),
+                });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    /*
+     * ============================================================
+     * SETTINGS
+     * ============================================================
+     *
+     * Small user-adjustable preferences, persisted across page loads and
+     * across every site the script runs on (GM_setValue is scoped to the
+     * script, not the page).
+     */
+
+    const settings = {
+        autoContinue: Boolean(
+            persistGet(SETTINGS_KEYS.autoContinue, CONFIG.auto_continue)
+        ),
+
+        // 'auto' follows the OS/browser preference; 'light'/'dark' pin it.
+        theme: ['auto', 'light', 'dark'].includes(
+            persistGet(SETTINGS_KEYS.theme, 'auto')
+        )
+            ? persistGet(SETTINGS_KEYS.theme, 'auto')
+            : 'auto',
+    };
+
+    function setAutoContinue(value) {
+        settings.autoContinue = Boolean(value);
+        persistSet(SETTINGS_KEYS.autoContinue, settings.autoContinue);
+    }
+
+    function cycleTheme() {
+        const order = ['auto', 'dark', 'light'];
+        const next = order[(order.indexOf(settings.theme) + 1) % order.length];
+
+        settings.theme = next;
+        persistSet(SETTINGS_KEYS.theme, next);
+
+        return next;
     }
 
     /*
@@ -241,18 +397,29 @@
 
     /*
      * ============================================================
-     * IZEN ORIGIN VALIDATION
+     * RESOLVER ORIGIN VALIDATION
      * ============================================================
      */
 
-    function isIzenHost(hostname) {
+    const RESOLVER_HOSTS = CONFIG.resolver_origins.map((origin) => {
+        try {
+            return new URL(origin).hostname.toLowerCase();
+        } catch {
+            return null;
+        }
+    }).filter(Boolean);
+
+    function isTrustedResolverHost(hostname) {
         const host = String(hostname || '').toLowerCase();
-        return host === 'izen.lol' || host.endsWith('.izen.lol');
+
+        return RESOLVER_HOSTS.some(
+            (trusted) => host === trusted || host.endsWith(`.${trusted}`)
+        );
     }
 
-    function referrerIsIzen() {
+    function referrerIsTrustedResolver() {
         const referrer = parseHttpUrl(document.referrer);
-        return Boolean(referrer && isIzenHost(referrer.hostname));
+        return Boolean(referrer && isTrustedResolverHost(referrer.hostname));
     }
 
     /*
@@ -348,8 +515,8 @@
         return source.href;
     }
 
-    function buildIzenHandoffUrl() {
-        const endpoint = new URL(IZEN_ENDPOINT);
+    function buildHandoffUrl(origin) {
+        const endpoint = new URL(RESOLVER_PATH, origin);
 
         endpoint.searchParams.set('url', getSourceUrlForHandoff());
 
@@ -365,8 +532,62 @@
         return endpoint.href;
     }
 
-    function handoffToIzen() {
-        // Protect against: target -> izen -> target -> izen -> target...
+    /*
+     * ============================================================
+     * RESOLVER FAILOVER
+     * ============================================================
+     *
+     * A plain page navigation can't tell us whether the destination
+     * actually loaded, so before committing to one resolver we send a
+     * lightweight HEAD probe (via GM_xmlhttpRequest, which isn't bound by
+     * CORS) and fall through the configured resolver list in order.
+     *
+     * If GM_xmlhttpRequest isn't granted, we skip probing entirely and
+     * just use the primary resolver, preserving the original behavior.
+     */
+
+    async function pingOrigin(origin, timeoutMs) {
+        try {
+            await gmHttpRequest({
+                method: 'HEAD',
+                url: origin,
+                timeout: timeoutMs,
+            });
+
+            return true;
+        } catch (error) {
+            log('Resolver unreachable:', origin, error);
+            return false;
+        }
+    }
+
+    async function selectResolverOrigin() {
+        const origins = CONFIG.resolver_origins;
+
+        if (!gmApi('GM_xmlhttpRequest') || origins.length <= 1) {
+            return origins[0];
+        }
+
+        for (const origin of origins) {
+            // eslint-disable-next-line no-await-in-loop
+            const reachable = await pingOrigin(
+                origin,
+                CONFIG.resolver_ping_timeout_ms
+            );
+
+            if (reachable) {
+                return origin;
+            }
+        }
+
+        // Every resolver failed its probe. Attempt the primary anyway —
+        // the probe itself may have been the thing that failed (e.g. a
+        // strict CSP), not the resolver.
+        return origins[0];
+    }
+
+    async function handoffToIzen() {
+        // Protect against: target -> resolver -> target -> resolver -> target...
         if (wasJustHandedOff()) {
             throw new Error('A redirect loop was detected. Reload the page and try again.');
         }
@@ -374,9 +595,10 @@
         markPendingHandoff();
         markHandoffNow();
 
-        const target = buildIzenHandoffUrl();
+        const origin = await selectResolverOrigin();
+        const target = buildHandoffUrl(origin);
 
-        log('Handing off to izen:', target);
+        log('Handing off to resolver:', target);
 
         window.location.replace(target);
     }
@@ -398,7 +620,7 @@
         // document.referrer can disappear because of browser privacy /
         // Referrer-Policy. Therefore we accept either an izen referrer or
         // our valid session handoff marker.
-        const trustedReturn = referrerIsIzen() || hasValidPendingHandoff();
+        const trustedReturn = referrerIsTrustedResolver() || hasValidPendingHandoff();
 
         if (!trustedReturn) {
             log('Ignoring untrusted redirect parameter.');
@@ -493,6 +715,10 @@
 
         const shadow = host.attachShadow({ mode: 'open' });
 
+        if (settings.theme !== 'auto') {
+            host.setAttribute('data-theme', settings.theme);
+        }
+
         shadow.innerHTML = `
             <style>
                 :host {
@@ -500,6 +726,71 @@
                     position: fixed;
                     inset: 0;
                     z-index: 2147483647;
+
+                    --bg-grad-1: rgba(99, 102, 241, 0.18);
+                    --bg-grad-2: #09090f;
+                    --bg-grad-3: #111827;
+                    --text-main: #e5e7eb;
+                    --card-border: rgba(255, 255, 255, 0.09);
+                    --card-bg: rgba(15, 23, 42, 0.72);
+                    --logo-color: #f8fafc;
+                    --logo-accent: #818cf8;
+                    --subtitle-color: #64748b;
+                    --dest-border: rgba(255, 255, 255, 0.07);
+                    --dest-bg: rgba(255, 255, 255, 0.035);
+                    --dest-color: #94a3b8;
+                    --countdown-color: #c4b5fd;
+                    --track-bg: rgba(255, 255, 255, 0.065);
+                    --fill-1: #6366f1;
+                    --fill-2: #a78bfa;
+                    --btn-secondary-bg: rgba(255, 255, 255, 0.07);
+                    --btn-secondary-color: #cbd5e1;
+                    --btn-secondary-border: rgba(255, 255, 255, 0.08);
+                    --icon-btn-color: #64748b;
+                }
+
+                @media (prefers-color-scheme: light) {
+                    :host(:not([data-theme="dark"])) {
+                        --bg-grad-1: rgba(99, 102, 241, 0.10);
+                        --bg-grad-2: #eef0fb;
+                        --bg-grad-3: #f8fafc;
+                        --text-main: #1e293b;
+                        --card-border: rgba(15, 23, 42, 0.08);
+                        --card-bg: rgba(255, 255, 255, 0.78);
+                        --logo-color: #0f172a;
+                        --logo-accent: #6366f1;
+                        --subtitle-color: #64748b;
+                        --dest-border: rgba(15, 23, 42, 0.08);
+                        --dest-bg: rgba(15, 23, 42, 0.04);
+                        --dest-color: #475569;
+                        --countdown-color: #6d28d9;
+                        --track-bg: rgba(15, 23, 42, 0.08);
+                        --btn-secondary-bg: rgba(15, 23, 42, 0.05);
+                        --btn-secondary-color: #334155;
+                        --btn-secondary-border: rgba(15, 23, 42, 0.09);
+                        --icon-btn-color: #94a3b8;
+                    }
+                }
+
+                :host([data-theme="light"]) {
+                    --bg-grad-1: rgba(99, 102, 241, 0.10);
+                    --bg-grad-2: #eef0fb;
+                    --bg-grad-3: #f8fafc;
+                    --text-main: #1e293b;
+                    --card-border: rgba(15, 23, 42, 0.08);
+                    --card-bg: rgba(255, 255, 255, 0.78);
+                    --logo-color: #0f172a;
+                    --logo-accent: #6366f1;
+                    --subtitle-color: #64748b;
+                    --dest-border: rgba(15, 23, 42, 0.08);
+                    --dest-bg: rgba(15, 23, 42, 0.04);
+                    --dest-color: #475569;
+                    --countdown-color: #6d28d9;
+                    --track-bg: rgba(15, 23, 42, 0.08);
+                    --btn-secondary-bg: rgba(15, 23, 42, 0.05);
+                    --btn-secondary-color: #334155;
+                    --btn-secondary-border: rgba(15, 23, 42, 0.09);
+                    --icon-btn-color: #94a3b8;
                 }
 
                 *, *::before, *::after {
@@ -522,20 +813,21 @@
                         max(20px, env(safe-area-inset-left));
                     overflow: auto;
                     background:
-                        radial-gradient(circle at 50% 12%, rgba(99, 102, 241, 0.18), transparent 34%),
-                        linear-gradient(135deg, #09090f 0%, #111827 52%, #111827 100%);
-                    color: #e5e7eb;
+                        radial-gradient(circle at 50% 12%, var(--bg-grad-1), transparent 34%),
+                        linear-gradient(135deg, var(--bg-grad-2) 0%, var(--bg-grad-3) 52%, var(--bg-grad-3) 100%);
+                    color: var(--text-main);
                     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
                     text-align: center;
                     -webkit-font-smoothing: antialiased;
                 }
 
                 .card {
+                    position: relative;
                     width: min(480px, 100%);
                     padding: clamp(28px, 6vw, 46px) clamp(22px, 5vw, 38px);
-                    border: 1px solid rgba(255, 255, 255, 0.09);
+                    border: 1px solid var(--card-border);
                     border-radius: 22px;
-                    background: rgba(15, 23, 42, 0.72);
+                    background: var(--card-bg);
                     box-shadow:
                         0 24px 80px rgba(0, 0, 0, 0.45),
                         0 0 80px rgba(99, 102, 241, 0.06);
@@ -553,19 +845,46 @@
                     to { transform: rotate(360deg); }
                 }
 
+                .toolbar {
+                    position: absolute;
+                    top: 14px;
+                    right: 14px;
+                    display: flex;
+                    gap: 6px;
+                }
+
+                .icon-btn {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: 30px;
+                    height: 30px;
+                    min-height: 0;
+                    padding: 0;
+                    border-radius: 9px;
+                    background: transparent;
+                    color: var(--icon-btn-color);
+                    font-size: 15px;
+                    box-shadow: none;
+                }
+
+                .icon-btn:hover {
+                    background: var(--btn-secondary-bg);
+                }
+
                 .logo {
                     margin-bottom: 6px;
                     font-size: clamp(22px, 5vw, 27px);
                     font-weight: 800;
                     letter-spacing: -0.7px;
-                    color: #f8fafc;
+                    color: var(--logo-color);
                 }
 
-                .logo-accent { color: #818cf8; }
+                .logo-accent { color: var(--logo-accent); }
 
                 .subtitle {
                     margin-bottom: 28px;
-                    color: #64748b;
+                    color: var(--subtitle-color);
                     font-size: 13px;
                     font-weight: 600;
                     letter-spacing: 0.7px;
@@ -576,38 +895,79 @@
                     margin-bottom: 18px;
                     padding: 11px 13px;
                     overflow: hidden;
-                    border: 1px solid rgba(255, 255, 255, 0.07);
+                    border: 1px solid var(--dest-border);
                     border-radius: 11px;
-                    background: rgba(255, 255, 255, 0.035);
-                    color: #94a3b8;
+                    background: var(--dest-bg);
+                    color: var(--dest-color);
                     font-size: 12px;
                     text-overflow: ellipsis;
                     white-space: nowrap;
+                    cursor: help;
+                }
+
+                .countdown-row {
+                    display: flex;
+                    align-items: baseline;
+                    justify-content: center;
+                    gap: 8px;
+                    margin-bottom: 14px;
                 }
 
                 .countdown {
-                    margin-bottom: 14px;
-                    color: #c4b5fd;
+                    color: var(--countdown-color);
                     font-size: 14px;
                     font-weight: 650;
+                    font-variant-numeric: tabular-nums;
+                }
+
+                .percent {
+                    color: var(--subtitle-color);
+                    font-size: 12px;
+                    font-weight: 600;
                     font-variant-numeric: tabular-nums;
                 }
 
                 .progress-track {
                     width: 100%;
                     height: 4px;
-                    margin-bottom: 26px;
+                    margin-bottom: 22px;
                     overflow: hidden;
                     border-radius: 999px;
-                    background: rgba(255, 255, 255, 0.065);
+                    background: var(--track-bg);
                 }
 
                 .progress-fill {
                     width: 0%;
                     height: 100%;
                     border-radius: inherit;
-                    background: linear-gradient(90deg, #6366f1, #a78bfa);
+                    background: linear-gradient(90deg, var(--fill-1), var(--fill-2));
                     transition: width 100ms linear;
+                }
+
+                .settings-row {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: 8px;
+                    margin-bottom: 18px;
+                    color: var(--subtitle-color);
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+
+                .settings-row label {
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    cursor: pointer;
+                    user-select: none;
+                }
+
+                .settings-row input[type="checkbox"] {
+                    width: 14px;
+                    height: 14px;
+                    accent-color: var(--fill-1);
+                    cursor: pointer;
                 }
 
                 .button-row {
@@ -661,18 +1021,11 @@
                     box-shadow: none;
                 }
 
-                #copyBtn {
+                #copyBtn, #retryBtn, #reportBtn {
                     display: none;
-                    background: rgba(255, 255, 255, 0.07);
-                    color: #cbd5e1;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                }
-
-                #retryBtn {
-                    display: none;
-                    background: rgba(255, 255, 255, 0.07);
-                    color: #cbd5e1;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    background: var(--btn-secondary-bg);
+                    color: var(--btn-secondary-color);
+                    border: 1px solid var(--btn-secondary-border);
                 }
 
                 .error {
@@ -716,6 +1069,16 @@
             <div class="overlay" role="dialog" aria-modal="true" aria-labelledby="izenTitle">
                 <section class="card">
 
+                    <div class="toolbar">
+                        <button
+                            class="icon-btn"
+                            id="themeBtn"
+                            type="button"
+                            title="Cycle theme (auto / dark / light)"
+                            aria-label="Cycle theme"
+                        >&#9788;</button>
+                    </div>
+
                     <div class="logo" id="izenTitle">
                         izen<span class="logo-accent">.lol</span>
                     </div>
@@ -724,16 +1087,27 @@
 
                     <div class="destination" id="destination">Preparing destination…</div>
 
-                    <div class="countdown" id="countdown" role="status" aria-live="polite">Preparing…</div>
+                    <div class="countdown-row">
+                        <span class="countdown" id="countdown" role="status" aria-live="polite">Preparing…</span>
+                        <span class="percent" id="percent"></span>
+                    </div>
 
                     <div class="progress-track" aria-hidden="true">
                         <div class="progress-fill" id="progressFill"></div>
+                    </div>
+
+                    <div class="settings-row">
+                        <label>
+                            <input type="checkbox" id="autoContinueToggle" />
+                            Auto-continue next time
+                        </label>
                     </div>
 
                     <div class="button-row">
                         <button id="continueBtn" type="button" disabled>Please wait…</button>
                         <button id="copyBtn" type="button">Copy destination</button>
                         <button id="retryBtn" type="button">Try again</button>
+                        <button id="reportBtn" type="button">Report broken site</button>
                     </div>
 
                     <div class="error" id="errorMsg" role="alert"></div>
@@ -753,10 +1127,14 @@
             shadow,
             destination: $('#destination'),
             countdown: $('#countdown'),
+            percent: $('#percent'),
             progressFill: $('#progressFill'),
             continueBtn: $('#continueBtn'),
             copyBtn: $('#copyBtn'),
             retryBtn: $('#retryBtn'),
+            reportBtn: $('#reportBtn'),
+            themeBtn: $('#themeBtn'),
+            autoContinueToggle: $('#autoContinueToggle'),
             errorMsg: $('#errorMsg'),
             spinner: $('#spinner'),
         };
@@ -871,6 +1249,7 @@
         stopCountdown();
 
         ui.progressFill.style.width = '100%';
+        ui.percent.textContent = '100%';
         ui.countdown.textContent = 'Ready to redirect!';
         ui.continueBtn.disabled = false;
         ui.continueBtn.textContent = 'Continue';
@@ -883,7 +1262,7 @@
             // Ignore.
         }
 
-        if (CONFIG.auto_continue) {
+        if (settings.autoContinue) {
             performRedirect(target, ui);
         }
     }
@@ -915,6 +1294,7 @@
             const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
 
             ui.progressFill.style.width = `${(progress * 100).toFixed(2)}%`;
+            ui.percent.textContent = `${Math.round(progress * 100)}%`;
 
             if (remainingMs <= 0) {
                 setReady(target, ui);
@@ -934,18 +1314,101 @@
 
     /*
      * ============================================================
+     * SETTINGS UI WIRING
+     * ============================================================
+     */
+
+    function wireSettingsControls(ui) {
+        ui.autoContinueToggle.checked = settings.autoContinue;
+
+        ui.autoContinueToggle.addEventListener('change', () => {
+            setAutoContinue(ui.autoContinueToggle.checked);
+        });
+
+        const applyThemeLabel = () => {
+            const glyphs = { auto: '☉', dark: '☽', light: '☀' };
+            ui.themeBtn.textContent = glyphs[settings.theme] || glyphs.auto;
+            ui.themeBtn.title = `Theme: ${settings.theme} (click to cycle)`;
+        };
+
+        applyThemeLabel();
+
+        ui.themeBtn.addEventListener('click', () => {
+            const next = cycleTheme();
+
+            if (next === 'auto') {
+                ui.host.removeAttribute('data-theme');
+            } else {
+                ui.host.setAttribute('data-theme', next);
+            }
+
+            applyThemeLabel();
+        });
+    }
+
+    function wireReportButton(ui, target) {
+        ui.reportBtn.style.display = 'block';
+
+        ui.reportBtn.addEventListener('click', () => {
+            const title = encodeURIComponent(
+                `Broken bypass on ${window.location.hostname}`
+            );
+
+            const scriptVersion =
+                typeof GM_info !== 'undefined' && GM_info?.script?.version
+                    ? GM_info.script.version
+                    : 'unknown';
+
+            const body = encodeURIComponent(
+                [
+                    `Gate site: ${window.location.href}`,
+                    `Resolved destination: ${target.href}`,
+                    `Script version: ${scriptVersion}`,
+                ].join('\n')
+            );
+
+            const reportUrl = `${CONFIG.report_issue_url}?title=${title}&body=${body}`;
+
+            window.open(reportUrl, '_blank', 'noopener,noreferrer');
+        });
+    }
+
+    /*
+     * ============================================================
      * REDIRECT UI
      * ============================================================
      */
 
     async function showRedirectUI(target) {
+        const waitTime = isLinkvertiseHashPage()
+            ? getWaitSeconds(CONFIG.linkvertise_hash_wait, 10)
+            : getWaitSeconds(CONFIG.time, 1);
+
+        const isInstant = !CONFIG.wait_before_redirect || waitTime <= 0;
+
+        // True zero-render fast path: when there's nothing to wait for and
+        // the user has opted into auto-continue, skip mounting the shadow
+        // DOM UI entirely and navigate immediately. If the navigation
+        // itself throws, fall through to the normal UI so the user isn't
+        // left on a blank page.
+        if (isInstant && settings.autoContinue) {
+            try {
+                window.location.assign(target.href);
+                return;
+            } catch (error) {
+                log('Instant redirect failed, falling back to UI:', error);
+            }
+        }
+
         await ensureDocumentRoot();
 
         const ui = createUI();
 
-        // Only display the destination hostname. This avoids exposing
-        // massive query strings/tokens in the main UI.
+        // Only display the destination hostname by default. This avoids
+        // exposing massive query strings/tokens in the main UI; the full
+        // URL is still available via the title tooltip and copy button.
         ui.destination.textContent = target.hostname;
+        ui.destination.title = target.href;
 
         // click works for desktop AND modern touch browsers. No separate
         // touchend handler is needed, preventing accidental double
@@ -967,9 +1430,8 @@
             }
         });
 
-        const waitTime = isLinkvertiseHashPage()
-            ? getWaitSeconds(CONFIG.linkvertise_hash_wait, 10)
-            : getWaitSeconds(CONFIG.time, 1);
+        wireSettingsControls(ui);
+        wireReportButton(ui, target);
 
         startCountdown(target, waitTime, ui);
     }
@@ -987,6 +1449,7 @@
             const ui = createUI();
             const message = error instanceof Error ? error.message : String(error);
 
+            wireSettingsControls(ui);
             showError(ui, message);
         } catch (uiError) {
             console.error('[izen userscript] Fatal error:', error, uiError);
@@ -1004,12 +1467,12 @@
             const current = new URL(window.location.href);
             const rawRedirect = current.searchParams.get('redirect');
 
-            // If izen has returned us a redirect, validate and display it.
-            // Otherwise send the current URL to izen.
+            // If a resolver has returned us a redirect, validate and
+            // display it. Otherwise send the current URL off for resolving.
             const target = rawRedirect ? getRedirectTarget() : null;
 
             if (!target) {
-                handoffToIzen();
+                await handoffToIzen();
                 return;
             }
 
@@ -1033,6 +1496,70 @@
         },
         { once: true }
     );
+
+    /*
+     * ============================================================
+     * MENU COMMANDS
+     * ============================================================
+     *
+     * Only registered when the userscript manager supports it. These give
+     * power users a way to retry or flip auto-continue without waiting for
+     * the on-page UI (useful if the page never reaches a stable state).
+     */
+
+    let autoContinueMenuId = null;
+
+    function updateAutoContinueMenuEntry() {
+        const register = gmApi('GM_registerMenuCommand');
+        const unregister = gmApi('GM_unregisterMenuCommand');
+
+        if (!register) {
+            return;
+        }
+
+        // Menu labels are captured at registration time in most managers,
+        // so drop the old toggle entry before adding the one reflecting
+        // the new state.
+        if (unregister && autoContinueMenuId !== null) {
+            try {
+                unregister(autoContinueMenuId);
+            } catch (error) {
+                log('Failed to unregister menu command:', error);
+            }
+        }
+
+        try {
+            autoContinueMenuId = register(
+                `Auto-continue: ${settings.autoContinue ? 'ON' : 'OFF'} (click to toggle)`,
+                () => {
+                    setAutoContinue(!settings.autoContinue);
+                    updateAutoContinueMenuEntry();
+                }
+            );
+        } catch (error) {
+            log('Failed to register menu command:', error);
+        }
+    }
+
+    function registerMenuCommands() {
+        const register = gmApi('GM_registerMenuCommand');
+
+        if (!register) {
+            return;
+        }
+
+        try {
+            register('Retry bypass (reload page)', () => {
+                window.location.reload();
+            });
+        } catch (error) {
+            log('Failed to register menu command:', error);
+        }
+
+        updateAutoContinueMenuEntry();
+    }
+
+    registerMenuCommands();
 
     // document-start means we can start immediately.
     main();
