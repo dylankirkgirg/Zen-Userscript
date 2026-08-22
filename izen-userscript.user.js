@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         izen.lol Bypass Userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.1.0
 // @description  Improved izen.lol userscript with safer redirects, multi-endpoint failover (izen.lol / bypass.vip / bypass.city), better mobile support, loop protection, persisted settings, and cleaner UI.
 // @author       Gabriel
 // @grant        GM_xmlhttpRequest
@@ -162,10 +162,30 @@
         // Resolver services to try, in priority order. Each is pinged (when
         // GM_xmlhttpRequest is available) and the first reachable one is
         // used; if none respond, the primary is used anyway.
-        resolver_origins: [
-            'https://izen.lol',
-            'https://bypass.vip',
-            'https://bypass.city',
+        //
+        // Each service has its own endpoint shape, confirmed from that
+        // service's own official userscript where possible:
+        //   - izen.lol:    GET /userscript      ?url=&apikey=&time=
+        //   - bypass.vip:  GET /userscript.html ?url=&key=&time=
+        //   - bypass.city: shape unconfirmed — mirrored on bypass.vip's
+        //     contract as a best guess since no official userscript for it
+        //     was available to check. Update this entry once confirmed.
+        resolvers: [
+            {
+                origin: 'https://izen.lol',
+                path: '/userscript',
+                apiKeyParam: 'apikey',
+            },
+            {
+                origin: 'https://bypass.vip',
+                path: '/userscript.html',
+                apiKeyParam: 'key',
+            },
+            {
+                origin: 'https://bypass.city',
+                path: '/userscript.html',
+                apiKeyParam: 'key',
+            },
         ],
 
         // How long to wait for a resolver to respond to a reachability
@@ -184,8 +204,6 @@
      * CONSTANTS
      * ============================================================
      */
-
-    const RESOLVER_PATH = '/userscript';
 
     const SETTINGS_KEYS = Object.freeze({
         autoContinue: 'izen_userscript_auto_continue',
@@ -401,9 +419,9 @@
      * ============================================================
      */
 
-    const RESOLVER_HOSTS = CONFIG.resolver_origins.map((origin) => {
+    const RESOLVER_HOSTS = CONFIG.resolvers.map((resolver) => {
         try {
-            return new URL(origin).hostname.toLowerCase();
+            return new URL(resolver.origin).hostname.toLowerCase();
         } catch {
             return null;
         }
@@ -515,8 +533,8 @@
         return source.href;
     }
 
-    function buildHandoffUrl(origin) {
-        const endpoint = new URL(RESOLVER_PATH, origin);
+    function buildHandoffUrl(resolver) {
+        const endpoint = new URL(resolver.path, resolver.origin);
 
         endpoint.searchParams.set('url', getSourceUrlForHandoff());
 
@@ -524,7 +542,7 @@
         const apiKey = String(CONFIG.apikey || '').trim();
 
         if (apiKey) {
-            endpoint.searchParams.set('apikey', apiKey);
+            endpoint.searchParams.set(resolver.apiKeyParam, apiKey);
         }
 
         endpoint.searchParams.set('time', String(getWaitSeconds(CONFIG.time, 1)));
@@ -561,29 +579,29 @@
         }
     }
 
-    async function selectResolverOrigin() {
-        const origins = CONFIG.resolver_origins;
+    async function selectResolver() {
+        const resolvers = CONFIG.resolvers;
 
-        if (!gmApi('GM_xmlhttpRequest') || origins.length <= 1) {
-            return origins[0];
+        if (!gmApi('GM_xmlhttpRequest') || resolvers.length <= 1) {
+            return resolvers[0];
         }
 
-        for (const origin of origins) {
+        for (const resolver of resolvers) {
             // eslint-disable-next-line no-await-in-loop
             const reachable = await pingOrigin(
-                origin,
+                resolver.origin,
                 CONFIG.resolver_ping_timeout_ms
             );
 
             if (reachable) {
-                return origin;
+                return resolver;
             }
         }
 
         // Every resolver failed its probe. Attempt the primary anyway —
         // the probe itself may have been the thing that failed (e.g. a
         // strict CSP), not the resolver.
-        return origins[0];
+        return resolvers[0];
     }
 
     async function handoffToIzen() {
@@ -595,8 +613,8 @@
         markPendingHandoff();
         markHandoffNow();
 
-        const origin = await selectResolverOrigin();
-        const target = buildHandoffUrl(origin);
+        const resolver = await selectResolver();
+        const target = buildHandoffUrl(resolver);
 
         log('Handing off to resolver:', target);
 
